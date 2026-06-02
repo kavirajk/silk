@@ -78,7 +78,9 @@ static constexpr uint64_t CQE_TAG_DOORBELL = 2;
     x(SCHEDULER_USER_TIME,     "SchedulerUserTime") \
     x(SCHEDULER_SYSTEM_TIME,   "SchedulerSystemTime") \
     x(SCHEDULER_IDLE_TIME,     "SchedulerIdleTime") \
-    x(PROFILE_RING_OVERFLOW,   "ProfileRingOverflow")
+    x(PROFILE_RING_OVERFLOW,   "ProfileRingOverflow") \
+    x(SUBMISSION_INBOX_HITS,   "SubmissionInboxHits") \
+    x(TASKRUN_DEFERRED,        "TaskrunDeferred")
 // clang-format on
 
 DECLARE_SIMPLE_COUNTERS(FIBER_SIMPLE_COUNTERS);
@@ -240,6 +242,13 @@ static thread_local Fiber * threadFiber = nullptr;
 
 // Proxy fiber for the current non-fiber thread; destroyed at thread exit.
 static thread_local std::unique_ptr<Fiber> proxyFiber;
+
+// CPU index this thread is the pinned scheduler thread for, or
+// INVALID_PROCESSOR_NUMBER if it is not a scheduler thread.  Set at the top of
+// runScheduler.  Used by the io_uring submission fast path to detect whether
+// the caller is the single issuer for a given ring; non-scheduler threads
+// (worker pool, proxy-fiber user threads, etc.) always take the inbox path.
+static thread_local uint32_t tlsSchedulerCpu = INVALID_PROCESSOR_NUMBER;
 
 Fiber::Fiber(bool isProxyFiber) noexcept
     : state(isProxyFiber ? FiberState::RUNNING : FiberState::SUSPENDED)
@@ -559,11 +568,6 @@ struct FiberScheduler::ProcessorState
         // that steal loops on neighboring CPUs can assist without races.
         SpinLock serviceLoopLock;
 
-        // Serializes all SQ submissions (io_uring_get_sqe + io_uring_submit).
-        // Multiple worker threads can land on the same CPU and call enqueueIo
-        // concurrently; io_uring's SQ ring is not thread-safe.
-        SpinLock submissionLock;
-
         // Protects suspendedList; co-located so insert/remove touch only this
         // cache line rather than also pulling in cache line 4+.
         SpinLock suspendedLock;
@@ -582,9 +586,8 @@ struct FiberScheduler::ProcessorState
 
         // Timestamp (TSC cycles) of the most recent io_uring_submit call.
         // Read in submitIo (time-gate) and handleCompletionQueue (SQ_WAIT
-        // emit) under serviceLoopLock; written in submitIo under
-        // submissionLock.  Relaxed atomic is sufficient: readers tolerate a
-        // slightly stale value.
+        // emit). Only written by the owning scheduler thread; relaxed atomic
+        // is sufficient because readers tolerate a slightly stale value.
         std::atomic<uint64_t> lastSubmitCycles{0};
 
         // Per-CPU latency profiler. Allocated only when Options::enableProfiler
@@ -601,6 +604,20 @@ struct FiberScheduler::ProcessorState
     SleepStack sleepQueue;
     SleepStack cancelQueue;
     SleepTree sleepTree;
+
+    // Cross-thread io submission inbox. Producers are any non-pinned thread
+    // that wants to submit to this ring (proxy fibers on user threads, fibers
+    // running on the worker pool, cancelIo against a foreign ring). The pinned
+    // scheduler thread for this CPU is the sole consumer, draining the inbox
+    // in handleSubmissionInbox on every service-loop iteration and replaying
+    // each request as a local SQE prep. Pattern mirrors sleepQueue / cancelQueue.
+    SubmissionInbox submissionInbox;
+
+    // Deferred submission requests held over from a previous inbox drain that
+    // ran out of SQ-ring slots. Local to the scheduler thread (single-threaded),
+    // re-tried at the start of the next handleSubmissionInbox iteration before
+    // popping any newly-arrived inbox entries.
+    Stack<SubmissionRequest, &SubmissionRequest::stackEntry> deferredSubmissions;
 
     // Per-CPU monotonic counter feeding the counter field of FiberId.
     // Initialized to 1 so the first allocated fiber (cpu=0, counter=0) does
@@ -641,10 +658,26 @@ void FiberScheduler::ProcessorState::initialize(uint32_t cpu) noexcept
     SILK_ASSERT(eventFd >= 0);
 
     io_uring_params params{};
+    if (options.ioUringDeferTaskRun)
+    {
+        // SINGLE_ISSUER: only the pinned scheduler thread may submit / enter.
+        // DEFER_TASKRUN: completions are deferred until the issuer next calls
+        //   io_uring_enter(GETEVENTS), so task_work doesn't preempt the
+        //   scheduler hot path at unrelated kernel/user transitions.
+        // COOP_TASKRUN: implied by DEFER_TASKRUN, set explicitly per liburing
+        //   convention. Suppresses IPI-driven wakes.
+        params.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN | IORING_SETUP_COOP_TASKRUN;
+    }
     int r = ::io_uring_queue_init_params(options.ioUringQueueSize, &ring, &params);
+    // -EINVAL on too-old kernels; the user opted into DEFER_TASKRUN via
+    // Options::ioUringDeferTaskRun so failure is fatal here.
     SILK_ASSERT(!r);
 
     SILK_ASSERT(params.features & IORING_FEAT_NODROP);
+    if (options.ioUringDeferTaskRun)
+    {
+        SILK_ASSERT(params.features & IORING_FEAT_SINGLE_MMAP);
+    }
 
     // Submit a persistent poll for the wakeup fd.  IORING_POLL_ADD_MULTI keeps
     // the SQE active indefinitely; each eventfd_write produces one CQE.
@@ -737,6 +770,14 @@ void FiberScheduler::ProcessorState::parkThread(uint64_t waitNs, CpuTimer * time
             // ETIME: timeout expired with no CQE (normal); EINTR: signal interrupted (normal).
             SILK_ASSERT(-r == ETIME || -r == EINTR);
         }
+        else if (r > 0)
+        {
+            // Under DEFER_TASKRUN this enter call ran the deferred task_work
+            // that posted at least one CQE.  Counts iterations where the
+            // scheduler thread successfully reaped a batch via its single
+            // park syscall — the signal that the flag is doing its job.
+            Perf::getSimpleCounter(simpleCounters[TASKRUN_DEFERRED], number).increment();
+        }
 
         timer->reset(simpleCounters[SCHEDULER_SYSTEM_TIME], number);
     }
@@ -755,6 +796,10 @@ bool FiberScheduler::ProcessorState::hasWork() const noexcept
         return true;
     }
     if (!cancelQueue.empty())
+    {
+        return true;
+    }
+    if (!submissionInbox.empty())
     {
         return true;
     }
@@ -822,7 +867,10 @@ void FiberScheduler::ProcessorState::enqueueWakeup() noexcept
 template <typename Setup>
 bool FiberScheduler::ProcessorState::enqueueIo(IoFuture * future, Setup && setup) noexcept
 {
-    std::lock_guard lock(submissionLock);
+    // Single-issuer invariant: only the pinned scheduler thread for this ring
+    // may write SQEs or call io_uring_enter.  All cross-thread callers route
+    // through submissionInbox + handleSubmissionInbox.
+    SILK_ASSERT(tlsSchedulerCpu == this->number);
 
     io_uring_sqe * sqe = ::io_uring_get_sqe(&ring);
     if (sqe)
@@ -840,8 +888,11 @@ bool FiberScheduler::ProcessorState::enqueueIo(IoFuture * future, Setup && setup
             // cancel to the correct ring (cross-ring cancels fail with -ENOENT).
             future->processorNumber = this->number;
 
-            if (profiler)
+            if (profiler && !future->submitTimestamp)
             {
+                // Producer-side stamping (handleSubmissionInbox replay) writes
+                // these fields before calling enqueueIo so IO_WAIT includes
+                // inbox dwell. Only fill them here for the local fast path.
                 future->submitTimestamp = Tsc::getCycles();
                 future->category = threadFiber ? threadFiber->fiberId.category : 0;
             }
@@ -858,12 +909,22 @@ bool FiberScheduler::ProcessorState::enqueueIo(IoFuture * future, Setup && setup
 
 // Submit pending SQEs to the kernel.  flush=true: unconditional flush.
 // flush=false: gated by ioUringFlushThreshold (count) or ioUringFlushTimeout.
+//
+// Single-issuer invariant: only the pinned scheduler thread for this ring may
+// enter the kernel via io_uring_submit.  runFiber post-suspend flush may be
+// called from a worker thread for a fiber whose home ring is foreign; in that
+// case we no-op (the home's scheduler thread will flush via its own service
+// loop after handleSubmissionInbox drains).
 bool FiberScheduler::ProcessorState::submitIo(bool flush) noexcept
 {
-    // Fast path: read SQ tail outside the lock. Returns false without taking
-    // the submission lock when there's nothing to submit or the count/staleness
-    // thresholds haven't been met. Kept small so it inlines into runFiber and
-    // enqueueWakeup; the rest lives in submitIoSlow.
+    if (tlsSchedulerCpu != this->number)
+    {
+        return false;
+    }
+
+    // Fast path: read SQ tail. Returns false when there's nothing to submit
+    // or the count/staleness thresholds haven't been met. Kept small so it
+    // inlines into runFiber and enqueueWakeup; the rest lives in submitIoSlow.
     TSAN_IGNORE_BEGIN();
     uint32_t count = ::io_uring_sq_ready(&ring);
     TSAN_IGNORE_END();
@@ -889,7 +950,7 @@ bool FiberScheduler::ProcessorState::submitIo(bool flush) noexcept
 
 __attribute__((noinline)) bool FiberScheduler::ProcessorState::submitIoSlow(uint64_t startCycles) noexcept
 {
-    std::lock_guard lock(submissionLock);
+    SILK_ASSERT(tlsSchedulerCpu == this->number);
 
     uint32_t count = ::io_uring_sq_ready(&ring);
     if (count == 0)
@@ -954,6 +1015,7 @@ struct FiberScheduler::SchedulerState
     std::unique_ptr<std::thread[]> workerThreads;
 
     MemoryPool<Fiber, &Fiber::stackEntry> fiberPool;
+    MemoryPool<SubmissionRequest, &SubmissionRequest::stackEntry> submissionRequestPool;
     IntrusiveQueue<Fiber, &Fiber::reservedNode> readyQueue;
 
     sem_t threadSemaphore{};
@@ -1391,97 +1453,211 @@ void FiberScheduler::releaseWaiters(uint64_t key) noexcept
     }
 }
 
+// Local fast path: the caller is the pinned scheduler thread for the target
+// ring (single-issuer invariant). Writes the SQE directly via the lambda;
+// retries via yield() if the SQ ring is temporarily full so the scheduler
+// loop has a chance to flush and drain completions.
 template <typename Setup>
 void FiberScheduler::enqueueIo(IoFuture * future, Setup && setup) noexcept
 {
-    ProcessorState * processor;
     for (;;)
     {
-        // Re-fetch processor on each iteration: if the SQ ring was full and we
-        // yielded, the fiber may have been stolen and now runs on a different CPU.
-        processor = &scheduler->processorState[getCurrentProcessor()];
+        ProcessorState * processor = &scheduler->processorState[tlsSchedulerCpu];
         if (processor->enqueueIo(future, std::forward<Setup>(setup)))
         {
-            break;
+            return;
         }
 
         // SQ ring full: yield to let the processor drain completions, then retry.
         Perf::getSimpleCounter(simpleCounters[SQ_RING_OVERFLOW], processor->number).increment();
         yield();
     }
+}
 
-    // Regular fiber: runFiber calls submitIo after the fiber suspends.
-    // Proxy fiber: submit immediately since there is no runFiber flush.
-    Fiber * fiber = getCurrentFiber();
-    if (fiber->isProxyFiber)
+// Pick the target processor for a new submission, and return true if the
+// caller is the pinned scheduler thread for that ring (i.e. the local
+// fast path is available).
+bool FiberScheduler::pickTargetProcessor(ProcessorState ** out) noexcept
+{
+    if (tlsSchedulerCpu != INVALID_PROCESSOR_NUMBER)
     {
-        processor->submitIo(true);
+        *out = &scheduler->processorState[tlsSchedulerCpu];
+        return true;
     }
+    *out = &scheduler->processorState[getCurrentProcessor()];
+    return false;
+}
+
+// Slow-path inbox push.  Allocates a SubmissionRequest from the per-scheduler
+// pool, stamps producer-side attribution (timestamp, category) so IO_WAIT
+// includes inbox dwell, and returns the request for the caller to fill in
+// op-specific fields.
+FiberScheduler::SubmissionRequest *
+FiberScheduler::allocateRequest(ProcessorState * target, IoFuture * future) noexcept
+{
+    auto * req = scheduler->submissionRequestPool.allocate();
+    SILK_ASSERT(req);
+    req->future = future;
+    if (target->profiler)
+    {
+        req->submitTimestamp = Tsc::getCycles();
+        req->category = threadFiber ? threadFiber->fiberId.category : 0;
+    }
+    else
+    {
+        req->submitTimestamp = 0;
+        req->category = 0;
+    }
+    return req;
+}
+
+void FiberScheduler::pushAndWake(ProcessorState * target, SubmissionRequest * req) noexcept
+{
+    Perf::getSimpleCounter(simpleCounters[SUBMISSION_INBOX_HITS], target->number).increment();
+    target->submissionInbox.push(req);
+    target->wakeThread();
 }
 
 void FiberScheduler::read(int fd, iovec * iov, uint64_t iov_len, uint64_t offset, uint64_t * bytesRead, IoFuture * future) noexcept
 {
     future->result = bytesRead;
-    enqueueIo(future, [=](io_uring_sqe * sqe) noexcept { ::io_uring_prep_readv(sqe, fd, iov, iov_len, offset); });
+
+    ProcessorState * target;
+    if (pickTargetProcessor(&target))
+    {
+        enqueueIo(future, [=](io_uring_sqe * sqe) noexcept { ::io_uring_prep_readv(sqe, fd, iov, iov_len, offset); });
+        return;
+    }
+
+    auto * req = allocateRequest(target, future);
+    req->op = SubmissionRequest::READV;
+    req->fd = fd;
+    req->rw.iov = iov;
+    req->rw.iov_len = static_cast<uint32_t>(iov_len);
+    req->rw.offset = offset;
+    pushAndWake(target, req);
 }
 
 void FiberScheduler::write(int fd, iovec * iov, uint64_t iov_len, uint64_t offset, uint64_t * bytesWritten, IoFuture * future) noexcept
 {
     future->result = bytesWritten;
-    enqueueIo(future, [=](io_uring_sqe * sqe) noexcept { ::io_uring_prep_writev(sqe, fd, iov, iov_len, offset); });
+
+    ProcessorState * target;
+    if (pickTargetProcessor(&target))
+    {
+        enqueueIo(future, [=](io_uring_sqe * sqe) noexcept { ::io_uring_prep_writev(sqe, fd, iov, iov_len, offset); });
+        return;
+    }
+
+    auto * req = allocateRequest(target, future);
+    req->op = SubmissionRequest::WRITEV;
+    req->fd = fd;
+    req->rw.iov = iov;
+    req->rw.iov_len = static_cast<uint32_t>(iov_len);
+    req->rw.offset = offset;
+    pushAndWake(target, req);
 }
 
 void FiberScheduler::poll(int fd, uint32_t events, uint64_t * triggeredEvents, IoFuture * future) noexcept
 {
     future->result = triggeredEvents;
-    enqueueIo(future, [=](io_uring_sqe * sqe) noexcept { ::io_uring_prep_poll_add(sqe, fd, events); });
+
+    ProcessorState * target;
+    if (pickTargetProcessor(&target))
+    {
+        enqueueIo(future, [=](io_uring_sqe * sqe) noexcept { ::io_uring_prep_poll_add(sqe, fd, events); });
+        return;
+    }
+
+    auto * req = allocateRequest(target, future);
+    req->op = SubmissionRequest::POLL_ADD;
+    req->fd = fd;
+    req->poll.events = events;
+    pushAndWake(target, req);
 }
 
 void FiberScheduler::connect(int fd, const sockaddr * addr, socklen_t addrlen, IoFuture * future) noexcept
 {
     future->result = nullptr;
-    enqueueIo(future, [=](io_uring_sqe * sqe) noexcept { ::io_uring_prep_connect(sqe, fd, addr, addrlen); });
+
+    ProcessorState * target;
+    if (pickTargetProcessor(&target))
+    {
+        enqueueIo(future, [=](io_uring_sqe * sqe) noexcept { ::io_uring_prep_connect(sqe, fd, addr, addrlen); });
+        return;
+    }
+
+    auto * req = allocateRequest(target, future);
+    req->op = SubmissionRequest::CONNECT;
+    req->fd = fd;
+    req->connect.addr = addr;
+    req->connect.addrlen = addrlen;
+    pushAndWake(target, req);
 }
 
 void FiberScheduler::accept(int fd, sockaddr * addr, socklen_t * addrlen, int flags, uint64_t * acceptedFd, IoFuture * future) noexcept
 {
     future->result = acceptedFd;
-    enqueueIo(future, [=](io_uring_sqe * sqe) noexcept { ::io_uring_prep_accept(sqe, fd, addr, addrlen, flags); });
+
+    ProcessorState * target;
+    if (pickTargetProcessor(&target))
+    {
+        enqueueIo(future, [=](io_uring_sqe * sqe) noexcept { ::io_uring_prep_accept(sqe, fd, addr, addrlen, flags); });
+        return;
+    }
+
+    auto * req = allocateRequest(target, future);
+    req->op = SubmissionRequest::ACCEPT;
+    req->fd = fd;
+    req->accept.addr = addr;
+    req->accept.addrlen = addrlen;
+    req->accept.flags = flags;
+    pushAndWake(target, req);
 }
 
 void FiberScheduler::cancelIo(IoFuture * future) noexcept
 {
     // The cancel SQE must go to the SAME io_uring ring that holds the original
-    // SQE.  If we submit the cancel to a different ring (e.g. because the fiber
-    // was work-stolen to another CPU between registering the poll and cancelling
-    // it), io_uring returns -ENOENT and the original operation is never removed,
-    // leaving the caller's IoFuture::wait() blocked forever.
+    // SQE.  Cross-ring cancels return -ENOENT, leaving the caller's wait()
+    // blocked forever.  When the target ring isn't owned by our pinned thread
+    // we route through that processor's submissionInbox.
     uint32_t processorNumber = future->processorNumber;
     if (processorNumber == INVALID_PROCESSOR_NUMBER)
     {
         processorNumber = getCurrentProcessor();
     }
 
-    auto * target = &scheduler->processorState[processorNumber];
+    ProcessorState * target = &scheduler->processorState[processorNumber];
 
-    auto setup = [=](io_uring_sqe * sqe) noexcept
+    if (tlsSchedulerCpu == target->number)
     {
-        ::io_uring_prep_cancel(sqe, future, 0);
-        ::io_uring_sqe_set_data64(sqe, CQE_TAG_CANCEL);
-    };
+        // Local fast path: write the cancel SQE directly.
+        for (;;)
+        {
+            bool ok = target->enqueueIo(nullptr, [=](io_uring_sqe * sqe) noexcept {
+                ::io_uring_prep_cancel(sqe, future, 0);
+                ::io_uring_sqe_set_data64(sqe, CQE_TAG_CANCEL);
+            });
+            if (ok)
+            {
+                break;
+            }
 
-    // Retry if the SQ ring is temporarily full.
-    while (!target->enqueueIo(nullptr, setup))
-    {
-        Perf::getSimpleCounter(simpleCounters[SQ_RING_OVERFLOW], target->number).increment();
-        yield();
+            Perf::getSimpleCounter(simpleCounters[SQ_RING_OVERFLOW], target->number).increment();
+            yield();
+        }
+        return;
     }
 
-    // If we enqueued to a remote processor's ring, force-submit.
-    if (processorNumber != getCurrentProcessor() || getCurrentFiber()->isProxyFiber)
-    {
-        target->submitIo(true);
-    }
+    // Slow path: route via the target's inbox.
+    auto * req = scheduler->submissionRequestPool.allocate();
+    SILK_ASSERT(req);
+    req->future = nullptr;
+    req->op = SubmissionRequest::CANCEL;
+    req->cancel.target = future;
+    req->submitTimestamp = 0;
+    req->category = 0;
+    pushAndWake(target, req);
 }
 
 void FiberScheduler::sleep(uint64_t nanoseconds, SleepFuture * future) noexcept
@@ -1557,8 +1733,15 @@ void FiberScheduler::runScheduler(ProcessorState * processor) noexcept
     CPU_SET(processor->number, &cpuSet);
     ::pthread_setaffinity_np(::pthread_self(), sizeof(cpuSet), &cpuSet);
 
+    // Mark this thread as the single issuer for processor->number's ring so
+    // enqueueIo's fast path knows it can write SQEs directly. Any thread
+    // without tlsSchedulerCpu set takes the submissionInbox slow path.
+    tlsSchedulerCpu = processor->number;
+
     // Initialize per-CPU resources pinned to this CPU so that mmap'd memory
-    // (io_uring rings, eventfd) is allocated on the local NUMA node.
+    // (io_uring rings, eventfd) is allocated on the local NUMA node. Under
+    // SINGLE_ISSUER, io_uring records the issuing task at queue_init time;
+    // this must run on the pinned thread (post-affinity, post-tls assignment).
     processor->initialize(processor->number);
     processor->initialized.store(true, std::memory_order_release);
 
@@ -1619,6 +1802,7 @@ bool FiberScheduler::runServiceLoop(ProcessorState * processor, uint64_t waitNs,
     // Drain all pending work that arrived while we were waiting (or immediately, when waitNs=0).
     bool didWork = false;
     didWork |= handleCompletionQueue(processor);
+    didWork |= handleSubmissionInbox(processor);
     didWork |= handleSleepQueue(processor);
     didWork |= handleCancelQueue(processor);
     didWork |= handleExpiredWaiters(processor);
@@ -1668,7 +1852,10 @@ bool FiberScheduler::runStealLoop(ProcessorState * processor, uint64_t idleSince
             continue;
         }
 
-        didWork |= runServiceLoop(victim, 0, timer);
+        // Steal helpers no longer drain the victim's service loop: under
+        // SINGLE_ISSUER, this thread is not the issuer for victim->ring, and
+        // foreign io_uring_submit fails with -EEXIST.  The victim's own
+        // scheduler thread runs its service loop; we only pull ready fibers.
 
         // We have a limited budget to spend doing work for others.
         bool stoleAny = false;
@@ -1834,6 +2021,130 @@ __attribute__((noinline)) bool FiberScheduler::handleCompletionQueueSlow(Process
     }
 
     return didWork;
+}
+
+bool FiberScheduler::handleSubmissionInbox(ProcessorState * processor) noexcept
+{
+    // Fast path: nothing deferred from a prior drain, inbox empty.
+    if (processor->deferredSubmissions.empty() && processor->submissionInbox.empty())
+    {
+        return false;
+    }
+
+    SubmissionRequest * head = processor->submissionInbox.popAll();
+    handleSubmissionInboxSlow(processor, head);
+    return true;
+}
+
+__attribute__((noinline)) void
+FiberScheduler::handleSubmissionInboxSlow(ProcessorState * processor, SubmissionRequest * head) noexcept
+{
+    SILK_ASSERT(tlsSchedulerCpu == processor->number);
+
+    // Replay one request as a local SQE prep on this processor's ring.  Returns
+    // true if the SQE was placed, false if the SQ ring is full.  Caller stops
+    // draining on the first false; the request and the unprocessed tail are
+    // stashed on deferredSubmissions for the next service-loop iteration.
+    auto replay = [&](SubmissionRequest * req) noexcept -> bool {
+        // Forward producer-side attribution to the future so IO_WAIT/CQ_WAIT
+        // include inbox dwell when profiling is enabled.
+        if (req->future)
+        {
+            req->future->submitTimestamp = req->submitTimestamp;
+            req->future->category = req->category;
+        }
+
+        bool ok = false;
+        switch (req->op)
+        {
+            case SubmissionRequest::READV:
+                ok = processor->enqueueIo(req->future, [&](io_uring_sqe * sqe) noexcept {
+                    ::io_uring_prep_readv(sqe, req->fd, req->rw.iov, req->rw.iov_len, req->rw.offset);
+                });
+                break;
+            case SubmissionRequest::WRITEV:
+                ok = processor->enqueueIo(req->future, [&](io_uring_sqe * sqe) noexcept {
+                    ::io_uring_prep_writev(sqe, req->fd, req->rw.iov, req->rw.iov_len, req->rw.offset);
+                });
+                break;
+            case SubmissionRequest::POLL_ADD:
+                ok = processor->enqueueIo(req->future, [&](io_uring_sqe * sqe) noexcept {
+                    ::io_uring_prep_poll_add(sqe, req->fd, req->poll.events);
+                });
+                break;
+            case SubmissionRequest::CONNECT:
+                ok = processor->enqueueIo(req->future, [&](io_uring_sqe * sqe) noexcept {
+                    ::io_uring_prep_connect(sqe, req->fd, req->connect.addr, req->connect.addrlen);
+                });
+                break;
+            case SubmissionRequest::ACCEPT:
+                ok = processor->enqueueIo(req->future, [&](io_uring_sqe * sqe) noexcept {
+                    ::io_uring_prep_accept(sqe, req->fd, req->accept.addr, req->accept.addrlen, req->accept.flags);
+                });
+                break;
+            case SubmissionRequest::CANCEL:
+                SILK_ASSERT(!req->future);
+                ok = processor->enqueueIo(nullptr, [&](io_uring_sqe * sqe) noexcept {
+                    ::io_uring_prep_cancel(sqe, req->cancel.target, 0);
+                    ::io_uring_sqe_set_data64(sqe, CQE_TAG_CANCEL);
+                });
+                break;
+        }
+        return ok;
+    };
+
+    auto deferTail = [&](SubmissionRequest * stalled, SubmissionRequest * tail) noexcept {
+        // SQ ring is full.  Stash the stalled request and everything after it
+        // on deferredSubmissions for the next service-loop iteration to retry.
+        // Push in arrival order so the next drain replays them first; the
+        // SubmissionInbox's LIFO pop semantics already mean strict ordering is
+        // not preserved across producers, so a tail re-walk is fine here.
+        Perf::getSimpleCounter(simpleCounters[SQ_RING_OVERFLOW], processor->number).increment();
+        SubmissionRequest * cur = stalled;
+        while (cur)
+        {
+            SubmissionRequest * next = SubmissionInbox::next(cur);
+            processor->deferredSubmissions.push(cur);
+            cur = next;
+        }
+        SILK_UNUSED(tail);
+    };
+
+    // First, drain anything we couldn't place on the previous iteration.
+    while (SubmissionRequest * deferred = processor->deferredSubmissions.pop())
+    {
+        if (!replay(deferred))
+        {
+            // SQ still full.  Push back and stop; do not touch the inbox so
+            // newly-arrived requests don't reorder ahead of deferred ones.
+            processor->deferredSubmissions.push(deferred);
+            // Re-push everything we just popped from the inbox so it survives.
+            deferTail(head, nullptr);
+            processor->submitIo(true);
+            return;
+        }
+        scheduler->submissionRequestPool.deallocate(deferred);
+    }
+
+    // Then drain freshly-arrived inbox entries.
+    SubmissionRequest * cur = head;
+    while (cur)
+    {
+        SubmissionRequest * next = SubmissionInbox::next(cur);
+        if (!replay(cur))
+        {
+            deferTail(cur, nullptr);
+            processor->submitIo(true);
+            return;
+        }
+        scheduler->submissionRequestPool.deallocate(cur);
+        cur = next;
+    }
+
+    // Force-submit immediately after a successful drain so any cross-thread
+    // producers waiting on a CQE see their request hit the kernel without
+    // waiting for the next batching threshold to trip.
+    processor->submitIo(true);
 }
 
 bool FiberScheduler::handleSleepQueue(ProcessorState * processor) noexcept

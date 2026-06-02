@@ -137,6 +137,15 @@ public:
         // isolation (e.g. head-of-line blocking benchmarks).
         // Production should leave this off.
         bool disableWorkStealing = false;
+
+        // Use IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN |
+        // IORING_SETUP_COOP_TASKRUN. Deferred task_work runs only inside
+        // io_uring_enter(GETEVENTS), so completion delivery is bounded to the
+        // scheduler's service loop and the hot path is not preempted by
+        // task_work at unrelated kernel/user transitions. Cross-thread io
+        // submissions are routed via a per-CPU lock-free inbox drained by the
+        // owning scheduler thread. Requires kernel >= 6.1.
+        bool ioUringDeferTaskRun = true;
     };
 
     /**
@@ -544,6 +553,63 @@ private:
     using SleepStack = LockFreeStack<SleepFuture, &SleepFuture::stackEntry>;
     using SleepTree = Tree<SleepFuture, &SleepFuture::treeEntry, CompareDeadline, true /* AllowDuplicates */>;
 
+    // Cross-thread io submission descriptor. When a thread that is not the
+    // pinned scheduler thread for the target ring wants to enqueue an io_uring
+    // operation, it allocates a SubmissionRequest, fills the op-specific
+    // fields, and pushes onto the target processor's submissionInbox. The
+    // owning scheduler thread drains the inbox inside its service loop and
+    // replays each request as a local SQE prep. Required by
+    // IORING_SETUP_SINGLE_ISSUER: only the owning thread may submit.
+    struct SubmissionRequest
+    {
+        enum Op : uint8_t
+        {
+            READV = 0,
+            WRITEV,
+            POLL_ADD,
+            CONNECT,
+            ACCEPT,
+            CANCEL,
+        };
+
+        StackEntry stackEntry;
+        IoFuture * future;          // null for CANCEL (fire-and-forget)
+        Op op;
+        uint8_t category;           // stamped at push time
+        uint64_t submitTimestamp;   // stamped at push time
+        int fd;
+        union
+        {
+            struct
+            {
+                iovec * iov;
+                uint32_t iov_len;
+                uint64_t offset;
+            } rw;
+            struct
+            {
+                uint32_t events;
+            } poll;
+            struct
+            {
+                const sockaddr * addr;
+                socklen_t addrlen;
+            } connect;
+            struct
+            {
+                sockaddr * addr;
+                socklen_t * addrlen;
+                int flags;
+            } accept;
+            struct
+            {
+                IoFuture * target;
+            } cancel;
+        };
+    };
+
+    using SubmissionInbox = LockFreeStack<SubmissionRequest, &SubmissionRequest::stackEntry>;
+
     struct StealCandidate
     {
         uint32_t processorNumber;
@@ -583,6 +649,9 @@ private:
     static void exitThreadModeSuspendCallback(Fiber * fiber, void * context) noexcept;
     template <typename Setup>
     static void enqueueIo(IoFuture * future, Setup && setup) noexcept;
+    static bool pickTargetProcessor(ProcessorState ** out) noexcept;
+    static SubmissionRequest * allocateRequest(ProcessorState * target, IoFuture * future) noexcept;
+    static void pushAndWake(ProcessorState * target, SubmissionRequest * req) noexcept;
     static void cancelIo(IoFuture * future) noexcept;
     static void cancelSleep(SleepFuture * future) noexcept;
     static void runScheduler(ProcessorState * processor) noexcept;
@@ -591,6 +660,8 @@ private:
     static bool handleReadyQueue(ProcessorState * processor, CpuTimer * timer) noexcept;
     static bool handleCompletionQueue(ProcessorState * processor) noexcept;
     static bool handleCompletionQueueSlow(ProcessorState * processor) noexcept;
+    static bool handleSubmissionInbox(ProcessorState * processor) noexcept;
+    static void handleSubmissionInboxSlow(ProcessorState * processor, SubmissionRequest * head) noexcept;
     static bool handleSleepQueue(ProcessorState * processor) noexcept;
     static void handleSleepQueueSlow(ProcessorState * processor, SleepFuture * sleepFuture) noexcept;
     static bool handleCancelQueue(ProcessorState * processor) noexcept;

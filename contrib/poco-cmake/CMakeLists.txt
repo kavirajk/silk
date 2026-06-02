@@ -14,6 +14,30 @@ file(GLOB POCO_FOUNDATION_SRCS ${POCO_SRC}/Foundation/src/*.cpp)
 list(FILTER POCO_FOUNDATION_SRCS EXCLUDE REGEX
     ".*_(UNIX|POSIX|WIN32|WIN32U|WINCE|VX|DEC|HPUX|QNX|SUN|STD|DUMMY|C99|Android)\\.cpp$|.*(EventLogChannel|WindowsConsoleChannel)\\.cpp$")
 
+# Foundation patches: qualify internal Poco::format() calls so they don't collide with
+# std::format under C++23 + libstdc++ 16 via ADL on std::string / std::vector args.
+set(POCO_FOUNDATION_PATCHED_FILES
+    Format
+)
+
+foreach(stem IN LISTS POCO_FOUNDATION_PATCHED_FILES)
+    execute_process(
+        COMMAND patch
+        -o ${CMAKE_CURRENT_BINARY_DIR}/${stem}.cpp
+        ${POCO_SRC}/Foundation/src/${stem}.cpp
+        INPUT_FILE ${CMAKE_CURRENT_SOURCE_DIR}/patches/${stem}.patch
+        RESULT_VARIABLE _patch_result
+    )
+    if(_patch_result GREATER 1)
+        message(FATAL_ERROR "Failed to patch Foundation/${stem}.cpp (exit code ${_patch_result})")
+    endif()
+endforeach()
+
+list(FILTER POCO_FOUNDATION_SRCS EXCLUDE REGEX ".*/Foundation/src/Format\\.cpp$")
+foreach(stem IN LISTS POCO_FOUNDATION_PATCHED_FILES)
+    list(APPEND POCO_FOUNDATION_SRCS ${CMAKE_CURRENT_BINARY_DIR}/${stem}.cpp)
+endforeach()
+
 add_library(_poco_foundation ${POCO_FOUNDATION_SRCS})
 add_library(Poco::Foundation ALIAS _poco_foundation)
 target_compile_options(_poco_foundation PRIVATE -w)
